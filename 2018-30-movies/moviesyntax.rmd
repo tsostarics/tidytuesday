@@ -1,0 +1,176 @@
+---
+title: "Movie Syntax"
+author: "Thomas Sostarics"
+date: "8/14/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+library(reticulate)
+library(tidyverse)
+library(RSQLite)
+library(sqldf)
+library(dbplyr)
+library(hrbrthemes)
+library(palettetown)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::knit_engines$set(python = reticulate::eng_python)
+```
+
+
+# Create database
+
+Set up database to query later. For some reason I ***cannot*** get `data.tsv`
+to load with `dbWriteTable()` when I give it the local filename. For some
+reason it only works when I read it into memory first, which is **definitely**
+not ideal. I think it has something to do with the single quote characters in
+some of the movie titles. `akas.tsv` doesn't have the same issue though.
+
+```{r create db}
+con <- dbConnect(SQLite(), dbname = "movies_db")
+
+large_data <- read_tsv('data.tsv')
+dbWriteTable(con, name="movies", value=large_data, overwrite=T,
+             row.names=FALSE, header=TRUE, sep = "\t")
+rm(large_data) # Free up a chunk of memory
+
+dbWriteTable(con, name="akas", value="akas.tsv", overwrite=T,
+             row.names=FALSE, header=TRUE, sep = "\t")
+```
+
+# SQL Query
+
+Run our query, essentially we want:
+  - Only movies
+  - Nothing with missing genres or release dates
+  - No News, Documentary, Biography, or History movies
+  - Preferential ranking of Horror > Adventure > Comedy > Action > Drama >>> Other
+  when a movie has more than one genre.
+  - Only movies with English titles
+  
+The cases short circuit, so Horror will take precedence over Adventure and so on.
+
+```{sql, connection=con, output.var="queried"}
+SELECT DISTINCT
+  d.tconst,
+  d.genres,
+  d.primaryTitle AS title,
+  d.startYear AS year,
+  CASE 
+    WHEN genres LIKE '%Horror%' THEN  'Horror'
+    WHEN genres LIKE '%Adventure%' THEN 'Adventure'
+    WHEN genres LIKE '%Action%' THEN 'Action'
+    WHEN genres = 'Comedy' THEN 'Comedy'
+    WHEN genres = 'Drama' THEN 'Drama'
+    ELSE 'Other'
+  END AS 'dominant_genre'
+FROM movies AS d
+LEFT JOIN akas AS a
+  ON d.tconst = a.titleID
+WHERE 
+  a.region        = 'US'
+  AND d.genres   <> '\\N'
+  AND d.titleType = 'movie'
+  AND startYear  <> '\\N'
+  AND d.primaryTitle = d.originalTitle
+  AND genres NOT LIKE '%News%'
+  AND genres NOT LIKE '%Documentary%'
+  AND genres NOT LIKE '%Biography%'
+  AND genres NOT LIKE '%History%'
+  AND dominant_genre <> 'Other';
+```
+
+# Run POS tagging in Python
+
+spaCy builds a syntactic tree, so I add a carrier sentence to prevent
+things like 'Red Planet' being incorrectly labeled as 'PROPN PROPN'
+instead of 'ADJ NOUN'.
+
+```{python}
+import pandas
+import numpy
+import nltk
+import spacy
+import pickle
+nlp = spacy.load('en')
+titles = [nlp('this movie is titled ' + title.lower()) for title in r.queried.title]
+
+print(len(titles))
+
+titles_tags = []
+
+for title in titles:
+  title_pos = ' '.join([w.pos_ for w in title[4:]]) #[4:] removes the carrier
+  titles_tags.append(title_pos)
+```
+
+# Post processing in R
+
+Here we add in the POS tags we got from python, then group and plot the data.
+
+```{r, warning=F}
+# Combine our POS tagging with our original movie data
+queried$tag <-  py$titles_tags
+queried$decade <- queried$year %/% 10 * 10
+
+# Get the counts of each tag form for every genre
+form_counts <- 
+  queried %>% 
+  filter(dominant_genre!='Other', year>=1980, year<2020) %>% 
+  group_by(dominant_genre, tag, decade) %>% 
+  summarize(count = n()) 
+
+# Get the total number that each tag form appears
+tag_totals <- 
+  form_counts %>% 
+  group_by(tag,decade) %>% 
+  summarize(decade_total = sum(count)) %>% 
+  group_by(tag) %>% 
+  mutate(tag_total = sum(decade_total))
+
+# Add in the tag totals and genre counts 
+form_counts <-
+  form_counts %>% 
+  left_join(tag_totals, by=c('tag', 'decade')) %>% 
+  filter(!is.na(tag_total),
+         tag_total>700) %>% 
+  group_by(dominant_genre, decade) %>% 
+  mutate(genre_total = sum(count)) %>% 
+  ungroup()
+
+# Calculate proportions and opacity
+form_probabilities <- 
+  form_counts %>% 
+  mutate(proportion = count/genre_total) %>%
+  group_by(tag, decade) %>% 
+  mutate(is_top = ifelse(proportion==max(proportion),1,.35), #1=opaque
+         decade = paste0(as.character(decade),"s")) 
+
+# Plot data
+form_probabilities %>% 
+  ggplot(aes(x=dominant_genre, y=proportion, fill=tag)) +
+  geom_bar(stat='identity', color='grey16', aes(alpha=I(is_top))) +
+  hrbrthemes::theme_ipsum() +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_fill_poke(pokemon=232,spread=6) +
+  ylab('Proportion of Movies using a Syntactic Form') +
+  xlab('Genre') +
+  ggtitle("Movie Title Syntactic Form Across Genres") +
+  labs(fill = 'Syntax') +
+  facet_wrap(~decade)+
+  scale_y_continuous(labels = scales::percent)+
+  labs(caption = 
+         'While overall proportions of movie title syntax have not varied much across genres over the past 40 years, and movies named "Noun"
+          (Silence; Eternity; Dolls) consistently account for 25-35% of movies, Horror movies have consistently had a slightly higher
+         proportion of movies named "The Noun" (The Shining; The Conjuring; The Thing) and Action movies have grown to 
+        have the highest proportion of movies with titles that are just "Proper Noun" (Steampunk; Icarus; Jacksonville).
+       (Opaque bars highlight which genre has the highest proportion for that syntactic form)
+       Data from IMDB
+       @tsostaricsling')
+```
+
